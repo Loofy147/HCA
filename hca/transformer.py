@@ -53,7 +53,7 @@ class HCATransformer(nn.Module):
         # Final Head
         self.lm_head = nn.Linear(dim, vocab_size)
 
-    def _forward_pass(self, x: torch.Tensor, feedback: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, List[torch.Tensor]]:
+    def _forward_pass(self, x: torch.Tensor, feedback: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, List[torch.Tensor], List[torch.Tensor]]:
         """
         Executes a single forward pass through the transformer layers.
 
@@ -62,29 +62,32 @@ class HCATransformer(nn.Module):
             feedback (Optional[torch.Tensor]): The feedback signal to inject into the first layer.
 
         Returns:
-            Tuple[torch.Tensor, List[torch.Tensor]]: A tuple containing:
+            Tuple[torch.Tensor, List[torch.Tensor], List[torch.Tensor]]: A tuple containing:
                 - The final hidden state of the pass.
                 - A list of attention weights from each layer.
+                - A list of value tensors from each layer.
         """
         attentions = []
+        values = []
         for i, (attn_layer, ffn, norm) in enumerate(zip(self.layers, self.ffns, self.norms)):
             # Inject feedback only into Layer 0 (The Roots)
             current_feedback = feedback if i == 0 else None
 
             # Attention Sub-layer
             residual = x
-            x, attn_w = attn_layer(x, feedback_signal=current_feedback)
+            x, attn_w, v = attn_layer(x, feedback_signal=current_feedback)
             x = norm(x + residual)
             attentions.append(attn_w)
+            values.append(v)
 
             # FFN Sub-layer
             residual = x
             x = ffn(x)
             x = norm(x + residual)
 
-        return x, attentions
+        return x, attentions, values
 
-    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, List[torch.Tensor], List[torch.Tensor]]:
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, List[torch.Tensor], List[torch.Tensor], List[torch.Tensor]]:
         """
         The main forward logic implementing the 2-pass system.
 
@@ -92,17 +95,18 @@ class HCATransformer(nn.Module):
             x (torch.Tensor): The input token IDs, shape (Batch, SeqLen).
 
         Returns:
-            Tuple[torch.Tensor, List[torch.Tensor], List[torch.Tensor]]: A tuple containing:
+            Tuple[torch.Tensor, List[torch.Tensor], List[torch.Tensor], List[torch.Tensor]]: A tuple containing:
                 - The final logits for prediction, shape (Batch, SeqLen, VocabSize).
                 - The attention weights from the first (local) pass.
                 - The attention weights from the second (refined) pass.
+                - The value tensors from the second (refined) pass.
         """
         B, L = x.shape
         x_emb = self.embedding(x) + self.pos_enc[:, :L, :]
 
         # --- PHASE 1: THE LOCAL PASS (Tree Construction) ---
         # Heads are constrained. They build local phrases.
-        hidden_state_1, attns_1 = self._forward_pass(x_emb, feedback=None)
+        hidden_state_1, attns_1, _ = self._forward_pass(x_emb, feedback=None) # values from pass 1 are ignored
 
         # --- PHASE 2: THE CYCLIC STEP (Reasoning) ---
         # 1. Extract Global Context
@@ -111,9 +115,9 @@ class HCATransformer(nn.Module):
         # 2. Re-run with "Sunlight"
         # The feedback vector enters Layer 0, modifying Queries to break local constraints.
         # Note: We re-use the original embedding `x_emb` as the input to the second pass.
-        hidden_state_2, attns_2 = self._forward_pass(x_emb, feedback=feedback_vector)
+        hidden_state_2, attns_2, values_2 = self._forward_pass(x_emb, feedback=feedback_vector)
 
         # Output prediction based on the Refined State
         logits = self.lm_head(hidden_state_2)
 
-        return logits, attns_1, attns_2
+        return logits, attns_1, attns_2, values_2

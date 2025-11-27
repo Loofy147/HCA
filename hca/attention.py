@@ -62,7 +62,7 @@ class HCAAttention(nn.Module):
 
         return mask
 
-    def forward(self, x: torch.Tensor, feedback_signal: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor]:
+    def forward(self, x: torch.Tensor, feedback_signal: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Performs the forward pass of the attention mechanism.
 
@@ -72,9 +72,10 @@ class HCAAttention(nn.Module):
                 injected into the queries, shape (Batch, Dim).
 
         Returns:
-            Tuple[torch.Tensor, torch.Tensor]: A tuple containing:
+            Tuple[torch.Tensor, torch.Tensor, torch.Tensor]: A tuple containing:
                 - The output tensor of shape (Batch, SeqLen, Dim).
                 - The attention weights of shape (Batch, NumHeads, SeqLen, SeqLen).
+                - The value tensor of shape (Batch, NumHeads, SeqLen, HeadDim).
         """
         B, L, D = x.shape
 
@@ -107,4 +108,4 @@ class HCAAttention(nn.Module):
 
         # 4. Output
         out = (attn_weights @ v).transpose(1, 2).reshape(B, L, D)
-        return self.out_proj(out), attn_weights
+        return self.out_proj(out), attn_weights, v

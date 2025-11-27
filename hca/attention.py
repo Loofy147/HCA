@@ -2,7 +2,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import math
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Union
+from .sparse import top_k_masking
 
 class HCAAttention(nn.Module):
     """
@@ -62,49 +63,45 @@ class HCAAttention(nn.Module):
 
         return mask
 
-    def forward(self, x: torch.Tensor, feedback_signal: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor]:
+    def forward(self, x: torch.Tensor, feedback_signal: Optional[torch.Tensor] = None, k: Optional[Union[int, torch.Tensor]] = None) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Performs the forward pass of the attention mechanism.
 
         Args:
             x (torch.Tensor): The input tensor of shape (Batch, SeqLen, Dim).
-            feedback_signal (Optional[torch.Tensor]): The global context signal to be
-                injected into the queries, shape (Batch, Dim).
+            feedback_signal (Optional[torch.Tensor]): The global context signal.
+            k (Optional[Union[int, torch.Tensor]]): If provided, applies adaptive
+                top-k sparsity to the attention scores.
 
         Returns:
-            Tuple[torch.Tensor, torch.Tensor]: A tuple containing:
+            Tuple[torch.Tensor, torch.Tensor, torch.Tensor]: A tuple containing:
                 - The output tensor of shape (Batch, SeqLen, Dim).
                 - The attention weights of shape (Batch, NumHeads, SeqLen, SeqLen).
+                - The value tensor of shape (Batch, NumHeads, SeqLen, HeadDim).
         """
         B, L, D = x.shape
 
-        # 1. Project Q, K, V
         q = self.q_proj(x).view(B, L, self.num_heads, self.head_dim).transpose(1, 2)
-        k = self.k_proj(x).view(B, L, self.num_heads, self.head_dim).transpose(1, 2)
+        k_proj = self.k_proj(x).view(B, L, self.num_heads, self.head_dim).transpose(1, 2)
         v = self.v_proj(x).view(B, L, self.num_heads, self.head_dim).transpose(1, 2)
 
-        # --- PILLAR 3: CYCLIC FEEDBACK INJECTION ---
-        # If "Sunlight" (Feedback) is present, modify the Queries.
-        # This allows the Global Context to bias what the head looks for.
         if feedback_signal is not None:
-            # feedback_signal: [B, D] -> Reshape to [B, 1, H, D_h] -> Transpose to [B, H, 1, D_h]
             fb = feedback_signal.view(B, 1, self.num_heads, self.head_dim).transpose(1, 2)
-            q = q + fb  # Injection: Q_new = Q_old + Global_Context
+            q = q + fb
 
-        # 2. Compute Raw Scores
-        scores = (q @ k.transpose(-2, -1)) / math.sqrt(self.head_dim)
+        scores = (q @ k_proj.transpose(-2, -1)) / math.sqrt(self.head_dim)
 
-        # --- PILLAR 2: TREE CONSTRAINT (Arborization) ---
-        # Apply Soft Mask (Penalty for non-local), then Hard Causal Mask
+        # --- ADAPTIVE SPARSITY (LEARNED) ---
+        if k is not None:
+            scores = top_k_masking(scores, k)
+
         soft_mask = self.create_soft_tree_mask(L, x.device)
         causal_mask = torch.triu(torch.ones(L, L, device=x.device), diagonal=1).bool()
 
-        scores = scores + soft_mask # Apply Energy Barrier
-        scores.masked_fill_(causal_mask, float('-inf')) # Strict Causality
+        scores = scores + soft_mask
+        scores.masked_fill_(causal_mask, float('-inf'))
 
-        # 3. Attention Weights
         attn_weights = F.softmax(scores, dim=-1)
 
-        # 4. Output
         out = (attn_weights @ v).transpose(1, 2).reshape(B, L, D)
-        return self.out_proj(out), attn_weights
+        return self.out_proj(out), attn_weights, v

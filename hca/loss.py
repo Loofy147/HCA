@@ -5,85 +5,88 @@ from typing import List, Tuple
 
 class HCALoss(nn.Module):
     """
-    The custom loss function for the HCA model, incorporating a Divergence Penalty.
-
-    This loss function combines a standard task-based loss (Cross-Entropy for language
-    modeling) with a "Lateral Repulsion Loss" designed to encourage attention head
-    specialization. The divergence penalty is calculated as the mean cosine similarity
-    between the attention maps of all head pairs in the first layer, encouraging them
-    to learn orthogonal (different) patterns.
+    The custom loss for HCA, combining task loss, divergence, and sparsity penalties.
     """
-    def __init__(self, divergence_weight: float = 0.1):
+    def __init__(self, divergence_weight: float = 0.1, sparsity_weight: float = 0.01):
         """
         Initializes the HCALoss.
 
         Args:
-            divergence_weight (float): The coefficient (lambda) to scale the divergence
-                penalty before adding it to the task loss.
+            divergence_weight (float): Coefficient for the head divergence penalty.
+            sparsity_weight (float): Coefficient for the sparsity regularization penalty.
         """
         super().__init__()
         self.task_criterion = nn.CrossEntropyLoss()
         self.div_weight = divergence_weight
+        self.sparsity_weight = sparsity_weight
 
-    def _divergence_penalty(self, attns: List[torch.Tensor]) -> torch.Tensor:
+    def _divergence_penalty(self, attns: List[torch.Tensor], values: List[torch.Tensor]) -> torch.Tensor:
         """
-        Calculates the divergence penalty (Semantic Orthogonality).
+        Calculates the enhanced divergence penalty.
 
-        This penalty aims to minimize the cosine similarity between the attention maps
-        of different heads in the first layer, forcing them to specialize.
+        This penalty combines two orthogonality constraints:
+        1.  **Attention Patterns**: Minimizes cosine similarity between attention maps.
+        2.  **Value Spaces**: Minimizes cosine similarity between value head outputs.
 
         Args:
-            attns (List[torch.Tensor]): A list of attention weight tensors from the
-                transformer, where each element has shape (Batch, Heads, Seq, Seq).
+            attns (List[torch.Tensor]): List of attention weights from the transformer.
+            values (List[torch.Tensor]): List of value tensors from the transformer.
 
         Returns:
             torch.Tensor: A scalar tensor representing the total divergence penalty.
         """
-        # We only apply the penalty to the first layer, as it's the most critical
-        # for foundational pattern divergence.
+        # We only apply the penalty to the first layer.
         layer0_attn = attns[0]
+        layer0_values = values[0]
         B, H, S, _ = layer0_attn.shape
 
-        # Flatten the attention maps to vectors for cosine similarity calculation
+        # --- 1. Attention Pattern Loss ---
         flat_maps = layer0_attn.view(B, H, -1)
-
-        # In batches, calculate cosine similarity between all pairs of heads (i, j) where i < j
         head_indices = torch.arange(H, device=flat_maps.device)
         pairs = torch.combinations(head_indices, r=2)
 
-        head1 = flat_maps[:, pairs[:, 0], :] # Shape: [B, num_pairs, S*S]
-        head2 = flat_maps[:, pairs[:, 1], :] # Shape: [B, num_pairs, S*S]
+        attn_head1 = flat_maps[:, pairs[:, 0], :]
+        attn_head2 = flat_maps[:, pairs[:, 1], :]
+        pattern_sim = F.cosine_similarity(attn_head1, attn_head2, dim=-1)
+        pattern_loss = torch.mean(pattern_sim)
 
-        # Cosine similarity is calculated along the last dimension (the flattened map)
-        # The result has shape [B, num_pairs], we then take the mean over all pairs and batches.
-        sim = F.cosine_similarity(head1, head2, dim=-1)
+        # --- 2. Value Space Loss ---
+        # Reshape values to [B, H, L*D_h]
+        flat_values = layer0_values.reshape(B, H, -1)
 
-        # The penalty is the mean similarity. We want to minimize this.
-        return torch.mean(sim)
+        value_head1 = flat_values[:, pairs[:, 0], :]
+        value_head2 = flat_values[:, pairs[:, 1], :]
+        value_sim = F.cosine_similarity(value_head1, value_head2, dim=-1)
+        value_loss = torch.mean(value_sim)
 
-    def forward(self, logits: torch.Tensor, targets: torch.Tensor, attns_final: List[torch.Tensor]) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        # Combine the two losses. The roadmap implies a 1:1 weighting for now.
+        return pattern_loss + value_loss
+
+    def forward(self, logits: torch.Tensor, targets: torch.Tensor, attns_final: List[torch.Tensor], values_final: List[torch.Tensor], predicted_k: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Computes the total loss for the HCA model.
 
         Args:
-            logits (torch.Tensor): The model's output logits, shape (Batch, SeqLen, VocabSize).
-            targets (torch.Tensor): The ground truth token IDs, shape (Batch, SeqLen).
-            attns_final (List[torch.Tensor]): The attention weights from the final pass,
-                used to calculate the divergence penalty.
+            logits (torch.Tensor): The model's output logits.
+            targets (torch.Tensor): The ground truth token IDs.
+            attns_final (List[torch.Tensor]): The attention weights from the final pass.
+            values_final (List[torch.Tensor]): The value tensors from the final pass.
+            predicted_k (torch.Tensor): The k values predicted by the sparsity predictor.
 
         Returns:
-            Tuple[torch.Tensor, torch.Tensor, torch.Tensor]: A tuple containing:
-                - The total combined loss.
-                - The task-specific loss.
-                - The divergence penalty loss.
+            A tuple containing: (total_loss, task_loss, div_loss, sparsity_loss)
         """
-        # 1. Standard Prediction Loss
-        # Reshape for CrossEntropyLoss which expects (N, C) and (N)
+        # 1. Task Loss
         task_loss = self.task_criterion(logits.view(-1, logits.size(-1)), targets.view(-1))
 
-        # 2. HCA Divergence Penalty
-        div_loss = self._divergence_penalty(attns_final)
+        # 2. Divergence Penalty
+        div_loss = self._divergence_penalty(attns_final, values_final)
 
-        # 3. Total Loss
-        total_loss = task_loss + (self.div_weight * div_loss)
-        return total_loss, task_loss, div_loss
+        # 3. Sparsity Regularization
+        # We penalize the model for using a large k. The mean of k across the
+        # batch is used as the penalty.
+        sparsity_loss = torch.mean(predicted_k)
+
+        # 4. Total Loss
+        total_loss = task_loss + (self.div_weight * div_loss) + (self.sparsity_weight * sparsity_loss)
+        return total_loss, task_loss, div_loss, sparsity_loss

@@ -5,39 +5,59 @@ class CyclicController(nn.Module):
     """
     The "brain" of the cyclic feedback loop.
 
-    This module takes the final hidden state of the transformer, pools it to create a
-    global context vector, and then processes this vector through a small neural network
-    to generate a feedback signal. This signal is then injected back into the first
-    attention layer to guide the "second pass" of reasoning.
+    This module takes a pre-computed global context vector and processes it to
+    generate a feedback signal.
     """
     def __init__(self, dim: int):
-        """
-        Initializes the CyclicController.
-
-        Args:
-            dim (int): The embedding dimension, which is the size of the feedback signal.
-        """
         super().__init__()
         self.net = nn.Sequential(
             nn.Linear(dim, dim // 2),
             nn.LayerNorm(dim // 2),
             nn.ReLU(),
             nn.Linear(dim // 2, dim),
-            nn.Tanh()  # Bound signal to avoid exploding gradients
+            nn.Tanh()
         )
 
-    def forward(self, final_hidden_state: torch.Tensor) -> torch.Tensor:
+    def forward(self, global_context: torch.Tensor) -> torch.Tensor:
         """
-        Generates the feedback signal from the final hidden state.
+        Generates the feedback signal from the global context.
 
         Args:
-            final_hidden_state (torch.Tensor): The output of the top transformer layer,
-                of shape (Batch, SeqLen, Dim).
+            global_context (torch.Tensor): The global context vector, shape (B, D).
 
         Returns:
-            torch.Tensor: The processed feedback signal of shape (Batch, Dim).
+            torch.Tensor: The processed feedback signal, shape (B, D).
         """
-        # Pool the sequence to get a summary vector. For a causal model, the last
-        # token's hidden state contains the accumulated history of the sequence.
-        global_context = final_hidden_state[:, -1, :]
         return self.net(global_context)
+
+
+class SparsityPredictor(nn.Module):
+    """
+    Predicts the number of tokens (k) to attend to for adaptive sparsity.
+
+    This network takes a global context vector and outputs a scalar value `k`
+    for each item in the batch.
+    """
+    def __init__(self, dim: int, max_seq_len: int):
+        super().__init__()
+        self.max_k = max_seq_len
+        self.net = nn.Sequential(
+            nn.Linear(dim, dim // 4),
+            nn.ReLU(),
+            nn.Linear(dim // 4, 1),
+            nn.Sigmoid()
+        )
+
+    def forward(self, global_context: torch.Tensor) -> torch.Tensor:
+        """
+        Predicts k based on the global context.
+
+        Args:
+            global_context (torch.Tensor): The aggregated context vector, shape (B, D).
+
+        Returns:
+            torch.Tensor: A tensor of k values, shape (B, 1).
+        """
+        k_scale = self.net(global_context)
+        predicted_k = 1 + (k_scale * (self.max_k - 1))
+        return predicted_k

@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 from .attention import HCAAttention
-from .controller import CyclicController
+from .controller import CyclicController, SparsityPredictor
 from typing import List, Tuple, Optional
 
 class HCATransformer(nn.Module):
@@ -47,44 +47,46 @@ class HCATransformer(nn.Module):
 
         self.norms = nn.ModuleList([nn.LayerNorm(dim) for _ in range(num_layers)])
 
-        # The Feedback Brain
+        # Controllers
         self.feedback_controller = CyclicController(dim)
+        self.sparsity_predictor = SparsityPredictor(dim, max_seq_len)
 
         # Final Head
         self.lm_head = nn.Linear(dim, vocab_size)
 
-    def _forward_pass(self, x: torch.Tensor, feedback: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, List[torch.Tensor]]:
+    def _forward_pass(self, x: torch.Tensor, feedback: Optional[torch.Tensor] = None, k: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, List[torch.Tensor], List[torch.Tensor]]:
         """
         Executes a single forward pass through the transformer layers.
 
         Args:
             x (torch.Tensor): The input tensor for the pass.
-            feedback (Optional[torch.Tensor]): The feedback signal to inject into the first layer.
+            feedback (Optional[torch.Tensor]): Feedback signal for the first layer.
+            k (Optional[torch.Tensor]): Sparsity level for all layers in this pass.
 
         Returns:
-            Tuple[torch.Tensor, List[torch.Tensor]]: A tuple containing:
+            Tuple[torch.Tensor, List[torch.Tensor], List[torch.Tensor]]: A tuple containing:
                 - The final hidden state of the pass.
                 - A list of attention weights from each layer.
+                - A list of value tensors from each layer.
         """
         attentions = []
+        values = []
         for i, (attn_layer, ffn, norm) in enumerate(zip(self.layers, self.ffns, self.norms)):
-            # Inject feedback only into Layer 0 (The Roots)
             current_feedback = feedback if i == 0 else None
 
-            # Attention Sub-layer
             residual = x
-            x, attn_w = attn_layer(x, feedback_signal=current_feedback)
+            x, attn_w, v = attn_layer(x, feedback_signal=current_feedback, k=k)
             x = norm(x + residual)
             attentions.append(attn_w)
+            values.append(v)
 
-            # FFN Sub-layer
             residual = x
             x = ffn(x)
             x = norm(x + residual)
 
-        return x, attentions
+        return x, attentions, values
 
-    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, List[torch.Tensor], List[torch.Tensor]]:
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, List[torch.Tensor], List[torch.Tensor], List[torch.Tensor], torch.Tensor]:
         """
         The main forward logic implementing the 2-pass system.
 
@@ -92,28 +94,27 @@ class HCATransformer(nn.Module):
             x (torch.Tensor): The input token IDs, shape (Batch, SeqLen).
 
         Returns:
-            Tuple[torch.Tensor, List[torch.Tensor], List[torch.Tensor]]: A tuple containing:
-                - The final logits for prediction, shape (Batch, SeqLen, VocabSize).
-                - The attention weights from the first (local) pass.
-                - The attention weights from the second (refined) pass.
+            Tuple[torch.Tensor, List[torch.Tensor], List[torch.Tensor], List[torch.Tensor], torch.Tensor]: A tuple containing:
+                - Final logits for prediction.
+                - Attention weights from the first (local) pass.
+                - Attention weights from the second (refined) pass.
+                - Value tensors from the second (refined) pass.
+                - The predicted k value for sparsity.
         """
         B, L = x.shape
         x_emb = self.embedding(x) + self.pos_enc[:, :L, :]
 
-        # --- PHASE 1: THE LOCAL PASS (Tree Construction) ---
-        # Heads are constrained. They build local phrases.
-        hidden_state_1, attns_1 = self._forward_pass(x_emb, feedback=None)
+        # --- Pass 1: Local Syntax ---
+        hidden_state_1, attns_1, _ = self._forward_pass(x_emb, feedback=None, k=None)
 
-        # --- PHASE 2: THE CYCLIC STEP (Reasoning) ---
-        # 1. Extract Global Context
-        feedback_vector = self.feedback_controller(hidden_state_1)
+        # --- Control Signal Generation ---
+        global_context = hidden_state_1[:, -1, :]
+        feedback_vector = self.feedback_controller(global_context)
+        predicted_k = self.sparsity_predictor(global_context)
 
-        # 2. Re-run with "Sunlight"
-        # The feedback vector enters Layer 0, modifying Queries to break local constraints.
-        # Note: We re-use the original embedding `x_emb` as the input to the second pass.
-        hidden_state_2, attns_2 = self._forward_pass(x_emb, feedback=feedback_vector)
+        # --- Pass 2: Refined Semantics with Sparsity ---
+        hidden_state_2, attns_2, values_2 = self._forward_pass(x_emb, feedback=feedback_vector, k=predicted_k)
 
-        # Output prediction based on the Refined State
         logits = self.lm_head(hidden_state_2)
 
-        return logits, attns_1, attns_2
+        return logits, attns_1, attns_2, values_2, predicted_k

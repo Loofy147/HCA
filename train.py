@@ -27,10 +27,10 @@ targets = torch.randint(0, vocab_size, (32, seq_len))
 
 # Training Step
 optimizer.zero_grad()
-logits, attn_pass1, attn_pass2 = model(inputs)
+logits, attn_pass1, attn_pass2, values_pass2 = model(inputs)
 
-# Calculate Loss (using only the finalized attention for divergence)
-loss, task_l, div_l = loss_fn(logits, targets, attn_pass2)
+# Calculate Loss (using the finalized attention and values for divergence)
+loss, task_l, div_l = loss_fn(logits, targets, attn_pass2, values_pass2)
 
 loss.backward()
 optimizer.step()

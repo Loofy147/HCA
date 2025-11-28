@@ -1,0 +1,7 @@
+Hello, world!
+This is a small dataset for the HCA model.
+It contains simple text to test the data loading and training pipeline.
+The goal is to verify that the model can learn from a real, albeit small, text file.
+HCA is a novel architecture, and this is the first step in training it on actual data.
+Let's see how it performs!
+Goodbye, world!

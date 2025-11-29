@@ -1,4 +1,5 @@
 import torch
+import os
 from dataclasses import dataclass
 from torch.utils.data import DataLoader
 from .transformer import HCATransformer
@@ -19,6 +20,7 @@ class TrainingConfig:
     learning_rate: float = 1e-3
     divergence_weight: float = 0.5
     sparsity_weight: float = 0.01
+    checkpoint_path: str = "checkpoints/model.pt"
 
 class Trainer:
     """
@@ -50,6 +52,34 @@ class Trainer:
             lr=config.learning_rate
         )
 
+    def save_checkpoint(self, epoch: int):
+        """
+        Saves a model checkpoint.
+        """
+        if not os.path.exists(os.path.dirname(self.config.checkpoint_path)):
+            os.makedirs(os.path.dirname(self.config.checkpoint_path))
+
+        torch.save({
+            'epoch': epoch,
+            'model_state_dict': self.model.state_dict(),
+            'optimizer_state_dict': self.optimizer.state_dict(),
+        }, self.config.checkpoint_path)
+        print(f"Checkpoint saved to {self.config.checkpoint_path}")
+
+    def load_checkpoint(self):
+        """
+        Loads a model checkpoint.
+        """
+        if not os.path.exists(self.config.checkpoint_path):
+            print("No checkpoint found, starting from scratch.")
+            return 0
+
+        checkpoint = torch.load(self.config.checkpoint_path)
+        self.model.load_state_dict(checkpoint['model_state_dict'])
+        self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        print(f"Checkpoint loaded from {self.config.checkpoint_path}")
+        return checkpoint['epoch']
+
     def train(self, epochs: int):
         """
         Runs the training loop for a specified number of epochs.
@@ -57,12 +87,14 @@ class Trainer:
         Args:
             epochs (int): The number of epochs to train for.
         """
+        start_epoch = self.load_checkpoint()
+
         dataloader = DataLoader(
             self.dataset,
             batch_size=self.config.batch_size,
             shuffle=True
         )
-        for epoch in range(epochs):
+        for epoch in range(start_epoch, epochs):
             for i, (inputs, targets) in enumerate(dataloader):
                 # Training Step
                 self.optimizer.zero_grad()
@@ -76,3 +108,5 @@ class Trainer:
 
                 avg_k = pred_k.mean().item()
                 print(f"Epoch {epoch+1}/{epochs}, Batch {i+1}/{len(dataloader)} | Task Loss: {task_l.item():.4f} | Div Loss: {div_l.item():.4f} | Sparsity Loss: {sparsity_l.item():.4f} | Avg k: {avg_k:.2f}")
+
+            self.save_checkpoint(epoch + 1)

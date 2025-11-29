@@ -28,7 +28,17 @@ The training process is encapsulated within a `Trainer` class. To start training
 python3 train.py
 ```
 
-The training script will print the loss and other metrics for each epoch.
+The training script will print the loss and other metrics for each epoch. Checkpoints will be saved to the `checkpoints/` directory by default.
+
+### Generation
+
+To generate text from a trained model, use the `generate.py` script:
+
+```bash
+python3 generate.py --prompt "Your prompt here" --num_chars 200
+```
+
+This will load the latest checkpoint and generate 200 characters of new text based on your prompt.
 
 ### Testing
 

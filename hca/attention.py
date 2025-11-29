@@ -91,15 +91,15 @@ class HCAAttention(nn.Module):
 
         scores = (q @ k_proj.transpose(-2, -1)) / math.sqrt(self.head_dim)
 
-        # --- ADAPTIVE SPARSITY (LEARNED) ---
-        if k is not None:
-            scores = top_k_masking(scores, k)
-
         soft_mask = self.create_soft_tree_mask(L, x.device)
         causal_mask = torch.triu(torch.ones(L, L, device=x.device), diagonal=1).bool()
 
         scores = scores + soft_mask
         scores.masked_fill_(causal_mask, float('-inf'))
+
+        # --- ADAPTIVE SPARSITY (LEARNED) ---
+        if k is not None:
+            scores = top_k_masking(scores, k)
 
         attn_weights = F.softmax(scores, dim=-1)
 
